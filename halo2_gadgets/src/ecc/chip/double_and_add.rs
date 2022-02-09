@@ -12,7 +12,7 @@ use halo2_proofs::{
 };
 use pasta_curves::arithmetic::{CurveAffine, FieldExt};
 
-/// Configuration implementing incomplete addition.
+/// Configuration implementing double-and-add.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct Config<C: CurveAffine> {
     q_dbl_and_add: Selector,
@@ -96,6 +96,7 @@ impl<C: CurveAffine> Config<C> {
             };
 
             // (y_r + y_dblq)(x_p − x_dblq) − (y_p − y_dblq)(x_dblq − x_r) = 0
+            // FIXME degree too high, witness gradient instead of inv_yq
             let poly2 =
                 (y_r + y_dblq.clone()) * (x_p - x_dblq.clone()) - (y_p - y_dblq) * (x_dblq - x_r);
 
@@ -108,7 +109,7 @@ impl<C: CurveAffine> Config<C> {
         });
     }
 
-    /// Assign region for double-and-add.
+    /// Assign region for double-and-add. P + 2Q
     pub fn assign_region(
         &self,
         p: &NonIdentityEccPoint<C>,

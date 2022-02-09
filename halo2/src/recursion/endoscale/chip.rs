@@ -424,3 +424,254 @@ where
         )
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{EndoscaleConfig, EndoscaleInstructions, TableConfig};
+    use ff::PrimeFieldBits;
+    use halo2_gadgets::utilities::lebs2ip;
+    use halo2_proofs::{
+        arithmetic::CurveAffine,
+        circuit::{Layouter, SimpleFloorPlanner},
+        plonk::{Circuit, ConstraintSystem, Error},
+        poly::commitment::Params,
+    };
+    use pasta_curves::{pallas, vesta};
+
+    use std::{convert::TryInto, marker::PhantomData};
+
+    #[derive(Default)]
+    struct BaseCircuit<
+        C: CurveAffine,
+        const NUM_BITS: usize,
+        const NUM_BITS_DIV2: usize,
+        const NUM_BITS_DIV10: usize,
+    >
+    where
+        C::Base: PrimeFieldBits,
+    {
+        bitstring: Option<[bool; NUM_BITS]>,
+        _marker: PhantomData<C>,
+    }
+
+    impl<
+            C: CurveAffine,
+            const NUM_BITS: usize,
+            const NUM_BITS_DIV2: usize,
+            const NUM_BITS_DIV10: usize,
+        > Circuit<C::Base> for BaseCircuit<C, NUM_BITS, NUM_BITS_DIV2, NUM_BITS_DIV10>
+    where
+        C::Base: PrimeFieldBits,
+    {
+        type Config = EndoscaleConfig<C, 10>;
+        type FloorPlanner = SimpleFloorPlanner;
+
+        fn without_witnesses(&self) -> Self {
+            Self::default()
+        }
+
+        fn configure(meta: &mut ConstraintSystem<C::Base>) -> Self::Config {
+            let table_config = TableConfig::configure(meta);
+
+            let constants = meta.fixed_column();
+            meta.enable_constant(constants);
+            let endoscalars = meta.instance_column();
+            let endoscalars_copy = meta.advice_column();
+            let word = meta.advice_column();
+            let acc = (meta.advice_column(), meta.advice_column());
+            let point = (meta.advice_column(), meta.advice_column());
+            let base = (meta.advice_column(), meta.advice_column());
+            let running_sum = meta.advice_column();
+            let pair = (meta.advice_column(), meta.advice_column());
+
+            meta.enable_equality(word);
+
+            EndoscaleConfig::<C, 10>::configure(
+                meta,
+                endoscalars,
+                endoscalars_copy,
+                word,
+                acc,
+                point,
+                base,
+                running_sum,
+                pair,
+                table_config,
+            )
+        }
+
+        fn synthesize(
+            &self,
+            config: Self::Config,
+            mut layouter: impl Layouter<C::Base>,
+        ) -> Result<(), Error> {
+            config.table.load(&mut layouter)?;
+
+            let challenge = {
+                let challenge = self.bitstring.map(|b| lebs2ip::<NUM_BITS>(&b));
+                challenge.map(C::Base::from)
+            };
+            // Decompose challenge into 2-bit windows.
+            let bitstring_pairs = {
+                layouter.assign_region(
+                    || "Decompose challenge",
+                    |mut region| {
+                        config
+                            .running_sum_pairs
+                            .witness_decompose::<NUM_BITS, NUM_BITS_DIV2>(
+                                &mut region,
+                                0,
+                                challenge,
+                                true,
+                            )
+                    },
+                )?
+            };
+
+            // Alg 1
+            let g_lagrange = Params::<C>::new(11).g_lagrange();
+            config.endoscale_base::<_, NUM_BITS, NUM_BITS_DIV2>(
+                layouter.namespace(|| "commit to challenge"),
+                g_lagrange[0],
+                &bitstring_pairs,
+            )?;
+
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct ScalarCircuit<
+        C: CurveAffine,
+        const NUM_BITS: usize,
+        const NUM_BITS_DIV2: usize,
+        const NUM_BITS_DIV10: usize,
+    >
+    where
+        C::Base: PrimeFieldBits,
+    {
+        bitstring: Option<[bool; NUM_BITS]>,
+        _marker: PhantomData<C>,
+    }
+
+    impl<
+            C: CurveAffine,
+            const NUM_BITS: usize,
+            const NUM_BITS_DIV2: usize,
+            const NUM_BITS_DIV10: usize,
+        > Circuit<C::Base> for ScalarCircuit<C, NUM_BITS, NUM_BITS_DIV2, NUM_BITS_DIV10>
+    where
+        C::Base: PrimeFieldBits,
+    {
+        type Config = EndoscaleConfig<C, 10>;
+        type FloorPlanner = SimpleFloorPlanner;
+
+        fn without_witnesses(&self) -> Self {
+            Self::default()
+        }
+
+        fn configure(meta: &mut ConstraintSystem<C::Base>) -> Self::Config {
+            let table_config = TableConfig::configure(meta);
+
+            let constants = meta.fixed_column();
+            meta.enable_constant(constants);
+            let endoscalars = meta.instance_column();
+            let endoscalars_copy = meta.advice_column();
+            let word = meta.advice_column();
+            let acc = (meta.advice_column(), meta.advice_column());
+            let point = (meta.advice_column(), meta.advice_column());
+            let base = (meta.advice_column(), meta.advice_column());
+            let running_sum = meta.advice_column();
+            let pair = (meta.advice_column(), meta.advice_column());
+
+            meta.enable_equality(word);
+
+            EndoscaleConfig::<C, 10>::configure(
+                meta,
+                endoscalars,
+                endoscalars_copy,
+                word,
+                acc,
+                point,
+                base,
+                running_sum,
+                pair,
+                table_config,
+            )
+        }
+
+        fn synthesize(
+            &self,
+            config: Self::Config,
+            mut layouter: impl Layouter<C::Base>,
+        ) -> Result<(), Error> {
+            config.table.load(&mut layouter)?;
+
+            let challenge = {
+                let challenge = self.bitstring.map(|b| lebs2ip::<NUM_BITS>(&b));
+                challenge.map(C::Base::from)
+            };
+
+            // Decompose challenge into 10-bit chunks.
+            let bitstring_chunks = {
+                layouter.assign_region(
+                    || "Decompose challenge",
+                    |mut region| {
+                        config
+                            .running_sum_chunks
+                            .witness_decompose::<NUM_BITS, NUM_BITS_DIV10>(
+                                &mut region,
+                                0,
+                                challenge,
+                                true,
+                            )
+                    },
+                )?
+            };
+
+            // Alg 2 with lookup
+            config.endoscale_scalar::<_, NUM_BITS, 10, NUM_BITS_DIV10>(
+                layouter.namespace(|| "endoscale bitstring with lookup"),
+                &bitstring_chunks,
+            )?;
+
+            Ok(())
+        }
+    }
+
+    fn test_endoscale_cycle<BaseCurve: CurveAffine, ScalarCurve: CurveAffine>()
+    where
+        BaseCurve::Base: PrimeFieldBits,
+        ScalarCurve::Base: PrimeFieldBits,
+    {
+        use halo2_proofs::dev::MockProver;
+
+        // Random 60-bit challenge.
+        let bitstring: Vec<_> = (0..60).map(|_| rand::random::<bool>()).collect();
+
+        let base_circuit = BaseCircuit::<BaseCurve, 60, 30, 6> {
+            bitstring: Some(bitstring.clone().try_into().unwrap()),
+            _marker: PhantomData,
+        };
+        let scalar_circuit = ScalarCircuit::<ScalarCurve, 60, 30, 6> {
+            bitstring: Some(bitstring.try_into().unwrap()),
+            _marker: PhantomData,
+        };
+
+        // Calls endoscale_base
+        let base_prover = MockProver::run(11, &base_circuit, vec![vec![]]).unwrap();
+        assert_eq!(base_prover.verify(), Ok(()));
+
+        // Calls endoscale_scalar
+        let scalar_prover = MockProver::run(11, &scalar_circuit, vec![vec![]]).unwrap();
+        assert_eq!(scalar_prover.verify(), Ok(()));
+
+        // TODO: Check consistency of resulting commitment / endoscalar
+    }
+
+    #[test]
+    fn test_endoscale() {
+        test_endoscale_cycle::<pallas::Affine, vesta::Affine>();
+        test_endoscale_cycle::<vesta::Affine, pallas::Affine>();
+    }
+}
