@@ -77,16 +77,16 @@ pub(crate) fn endoscale_scalar_with_lookup<F: FieldExt, const K: usize>(bits: &[
 }
 
 /// Maps a pair of bits to a multiple of a base using endoscaling.
-pub(crate) fn endoscale_pair<C: CurveAffine>(bits: (bool, bool), base: C) -> CtOption<C> {
+pub(crate) fn endoscale_pair<C: CurveAffine>(bits: [bool; 2], base: C) -> CtOption<C> {
     let mut base = {
         let base = base.coordinates();
         (*base.unwrap().x(), *base.unwrap().y())
     };
-    if bits.0 {
+    if bits[0] {
         base.1 = -base.1;
     }
 
-    if bits.1 {
+    if bits[1] {
         base.0 *= C::Base::ZETA;
     }
 
@@ -107,7 +107,7 @@ pub(crate) fn endoscale<C: CurveAffine, const K: usize>(
     let mut acc = base.to_curve() + base * C::Scalar::ZETA;
 
     for j in 0..(K / 2) {
-        let pair = (bits[2 * j], bits[2 * j + 1]);
+        let pair = [bits[2 * j], bits[2 * j + 1]];
         let endo = endoscale_pair::<C>(pair, base);
         acc = acc.double();
         acc += endo.unwrap();

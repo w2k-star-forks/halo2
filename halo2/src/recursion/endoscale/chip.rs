@@ -1,16 +1,18 @@
 use super::{
-    primitive::{endoscale_scalar, i2lebsp},
+    primitive::{endoscale_pair, endoscale_scalar, i2lebsp},
     EndoscaleInstructions,
 };
 use ff::PrimeFieldBits;
+use group::Curve;
 use halo2_gadgets::{
     ecc::chip::{double_and_add, witness_point},
-    utilities::{decompose_running_sum::be, UtilitiesInstructions},
+    utilities::{bool_check, boolean::Bit, decompose_running_sum::be, UtilitiesInstructions},
 };
 use halo2_proofs::{
     arithmetic::CurveAffine,
     circuit::{AssignedCell, Layouter},
-    plonk::{Advice, Column, ConstraintSystem, Error, Instance, Selector, TableColumn},
+    plonk::{Advice, Column, ConstraintSystem, Error, Expression, Instance, Selector, TableColumn},
+    poly::Rotation,
 };
 use pasta_curves::arithmetic::FieldExt;
 use std::marker::PhantomData;
@@ -159,6 +161,61 @@ where
         meta.enable_equality(base.0);
         meta.enable_equality(base.1);
 
+        /*
+            The accumulator is initialised to [2](φ(P) + P) = (init_x, init_y).
+
+            | b_0 | b_1 |   endo_x  |   endo_y   | acc_x  | acc_y  | P_x | P_y | <- column names
+            --------------------------------------------------------------------
+            | b_0 | b_1 | endo(P)_x |  endo(P)_y | init_x | init_y | P_x | P_y |
+
+            (0, 0) -> (P_x, -P_y)
+            (0, 1) -> (ζ * P_x, -P_y)
+            (1, 0) -> (P_x, P_y)
+            (1, 1) -> (ζ * P_x, P_y)
+        */
+        meta.create_gate("Endoscale base", |meta| {
+            let q_endoscale_base = meta.query_selector(config.q_endoscale_base);
+
+            // Pair of bits from the decomposition.
+            let b_0 = meta.query_advice(config.pair.0, Rotation::cur());
+            let b_1 = meta.query_advice(config.pair.1, Rotation::cur());
+
+            // Boolean-constrain b_0, b_1
+            let b_0_check = bool_check(b_0.clone());
+            let b_1_check = bool_check(b_1.clone());
+
+            // Check that `b_0, b_1` are consistent with the running sum decomposition.
+            let decomposition_check = {
+                let word = b_0.clone() + Expression::Constant(C::Base::from(2)) * b_1.clone();
+                let expected_word = config.running_sum_pairs.window_expr()(meta);
+
+                word - expected_word
+            };
+
+            // If the first bit is set, check that endo_y = -P_y
+            let y_check = {
+                let endo_y = meta.query_advice(config.point.1, Rotation::cur());
+                let p_y = meta.query_advice(config.base.1, Rotation::cur());
+                b_0 * (endo_y + p_y)
+            };
+            // If the second bit is set, check that endo_x = ζ * P_x
+            let x_check = {
+                let endo_x = meta.query_advice(config.point.0, Rotation::cur());
+                let p_x = meta.query_advice(config.base.0, Rotation::cur());
+                let zeta = Expression::Constant(C::Base::ZETA);
+                b_1 * (endo_x - zeta * p_x)
+            };
+
+            std::array::IntoIter::new([
+                ("b_0_check", b_0_check),
+                ("b_1_check", b_1_check),
+                ("decomposition_check", decomposition_check),
+                ("x_check", x_check),
+                ("y_check", y_check),
+            ])
+            .map(move |(name, poly)| (name, q_endoscale_base.clone() * poly))
+        });
+
         config
     }
 }
@@ -170,9 +227,9 @@ where
     #[allow(clippy::type_complexity)]
     fn endoscale_base<L: Layouter<C::Base>, const NUM_BITS: usize, const NUM_WINDOWS: usize>(
         &self,
-        mut _layouter: L,
-        _base: C,
-        _bitstring: &be::RunningSum<C::Base, 2, NUM_WINDOWS>,
+        mut layouter: L,
+        base: C,
+        bitstring: &be::RunningSum<C::Base, 2, NUM_WINDOWS>,
     ) -> Result<
         (
             AssignedCell<C::Base, C::Base>,
@@ -180,7 +237,89 @@ where
         ),
         Error,
     > {
-        todo!()
+        layouter.assign_region(
+            || "Commit to bitstring",
+            |mut region| {
+                let mut offset = 0;
+                // The accumulator is initialised to [2](φ(P) + P) = (init_x, init_y).
+                let mut acc = {
+                    let acc = base.to_curve() + base * C::Scalar::ZETA;
+                    self.acc_point_config.point_non_id_from_constant(
+                        acc.to_affine(),
+                        offset,
+                        &mut region,
+                    )?
+                };
+
+                // Copy the running sum into the correct offset.
+                for (idx, z) in bitstring.zs().enumerate() {
+                    z.copy_advice(
+                        || format!("Copy running sum {}", NUM_WINDOWS - idx),
+                        &mut region,
+                        self.running_sum_pairs.z(),
+                        offset + idx,
+                    )?;
+                }
+
+                for (pair_idx, pair) in bitstring
+                    .windows()
+                    .iter()
+                    .map(|w| w.map(|w| w.bits()))
+                    .enumerate()
+                {
+                    self.q_endoscale_base.enable(&mut region, offset)?;
+
+                    // Assign base_x
+                    region.assign_advice_from_constant(
+                        || "base_x",
+                        self.base.0,
+                        offset,
+                        *base.coordinates().unwrap().x(),
+                    )?;
+
+                    // Assign base_y
+                    region.assign_advice_from_constant(
+                        || "base_y",
+                        self.base.1,
+                        offset,
+                        *base.coordinates().unwrap().y(),
+                    )?;
+
+                    // Assign b_0
+                    let b_0: Option<Bit> = pair.map(|pair| pair[0].into());
+                    region.assign_advice(
+                        || format!("pair_idx: {}, b_0", pair_idx),
+                        self.pair.0,
+                        offset,
+                        || b_0.ok_or(Error::Synthesis),
+                    )?;
+
+                    // Assign b_1
+                    let b_1: Option<Bit> = pair.map(|pair| pair[1].into());
+                    region.assign_advice(
+                        || format!("pair_idx: {}, b_1", pair_idx),
+                        self.pair.1,
+                        offset,
+                        || b_1.ok_or(Error::Synthesis),
+                    )?;
+
+                    // Assign endoscaled point
+                    let endo = pair.map(|pair| endoscale_pair::<C>(pair, base).unwrap());
+                    let endo = self
+                        .endo_point_config
+                        .point_non_id(endo, offset, &mut region)?;
+
+                    // Add endo to acc.
+                    acc =
+                        self.dbl_and_add_config
+                            .assign_region(&endo, &acc, offset, &mut region)?;
+
+                    offset += 1;
+                }
+
+                Ok((acc.x(), acc.y()))
+            },
+        )
     }
 
     fn endoscale_scalar<
