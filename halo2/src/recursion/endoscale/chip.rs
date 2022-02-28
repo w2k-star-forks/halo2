@@ -2,7 +2,7 @@ use super::{
     primitive::{endoscale_pair, endoscale_scalar, i2lebsp},
     EndoscaleInstructions,
 };
-use ff::PrimeFieldBits;
+use ff::{Field, PrimeFieldBits};
 use group::Curve;
 use halo2_gadgets::{
     ecc::chip::{double_and_add, witness_point},
@@ -158,6 +158,7 @@ where
 
         meta.enable_equality(config.endoscalars);
         meta.enable_equality(config.endoscalars_copy);
+        meta.enable_equality(acc.0);
         meta.enable_equality(base.0);
         meta.enable_equality(base.1);
 
@@ -214,6 +215,37 @@ where
                 ("y_check", y_check),
             ])
             .map(move |(name, poly)| (name, q_endoscale_base.clone() * poly))
+        });
+
+        meta.create_gate("Endoscale scalar with lookup", |meta| {
+            let q_endoscale_scalar = meta.query_selector(config.q_endoscale_scalar);
+            let endo = meta.query_advice(config.endoscalars_copy, Rotation::cur());
+            let acc = meta.query_advice(config.acc.0, Rotation::cur());
+            let next_acc = meta.query_advice(config.acc.0, Rotation::next());
+
+            // Check that next_acc = acc + endo * 2^{K/2}
+            let expected_next_acc = acc + (endo * C::Base::from(1 << (K / 2)));
+
+            vec![q_endoscale_scalar * (next_acc - expected_next_acc)]
+        });
+
+        meta.lookup(|meta| {
+            let q_lookup = meta.query_selector(config.q_lookup);
+            let neg_q_lookup = Expression::Constant(C::Base::one()) - q_lookup.clone();
+            let word = config.running_sum_chunks.window_expr()(meta);
+            let endo = meta.query_advice(config.endoscalars_copy, Rotation::cur());
+            let default_endo = {
+                let val = endoscale_scalar(C::Base::zero(), &[false; K]);
+                Expression::Constant(val)
+            };
+
+            vec![
+                (q_lookup.clone() * word, table.bits),
+                (
+                    q_lookup * endo + neg_q_lookup * default_endo,
+                    table.endoscalar,
+                ),
+            ]
         });
 
         config
@@ -329,9 +361,66 @@ where
         const NUM_WINDOWS: usize,
     >(
         &self,
-        mut _layouter: L,
-        _bitstring: &be::RunningSum<C::Base, WINDOW_NUM_BITS, NUM_WINDOWS>,
+        mut layouter: L,
+        bitstring: &be::RunningSum<C::Base, WINDOW_NUM_BITS, NUM_WINDOWS>,
     ) -> Result<AssignedCell<C::Base, C::Base>, Error> {
-        todo!()
+        layouter.assign_region(
+            || "Endoscale scalar using bitstring (lookup optimisation)",
+            |mut region| {
+                let mut offset = 0;
+                // The endoscalar is initialised to 2 * (ζ + 1).
+                let mut acc = {
+                    let init = (C::Base::ZETA + C::Base::one()).double();
+                    region.assign_advice_from_constant(
+                        || "initialise acc",
+                        self.acc.0,
+                        offset,
+                        init,
+                    )?
+                };
+
+                // Copy the running sum into the correct offset.
+                for (idx, z) in bitstring.zs().enumerate() {
+                    z.copy_advice(
+                        || format!("Copy running sum {}", NUM_WINDOWS - idx),
+                        &mut region,
+                        self.running_sum_chunks.z(),
+                        offset + idx,
+                    )?;
+                }
+
+                // For each chunk, lookup the (chunk, endoscalar) pair and add
+                // it to the accumulator.
+                for (idx, chunk) in bitstring.windows().iter().enumerate() {
+                    self.q_endoscale_scalar.enable(&mut region, offset)?;
+                    self.q_lookup.enable(&mut region, offset)?;
+
+                    let endoscalar = chunk.map(|c| endoscale_scalar(C::Base::zero(), &c.bits()));
+                    // Witness endoscalar.
+                    region.assign_advice(
+                        || format!("Endoscalar for chunk {}", NUM_WINDOWS - 1 - idx),
+                        self.endoscalars_copy,
+                        offset,
+                        || endoscalar.ok_or(Error::Synthesis),
+                    )?;
+
+                    // Bitshift the endoscalar by {K / 2} and add to accumulator.
+                    let acc_val = acc
+                        .value()
+                        .zip(endoscalar)
+                        .map(|(&acc, endo)| acc + endo * C::Base::from(1 << (K / 2)));
+                    acc = region.assign_advice(
+                        || format!("Endoscalar for chunk {}", NUM_WINDOWS - 1 - idx),
+                        self.acc.0,
+                        offset + 1,
+                        || acc_val.ok_or(Error::Synthesis),
+                    )?;
+
+                    offset += 1;
+                }
+
+                Ok(acc)
+            },
+        )
     }
 }
