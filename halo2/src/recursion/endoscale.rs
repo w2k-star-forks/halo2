@@ -50,4 +50,18 @@ where
         layouter: L,
         bitstring: &be::RunningSum<C::Base, WINDOW_NUM_BITS, NUM_WINDOWS>,
     ) -> Result<AssignedCell<C::Base, C::Base>, Error>;
+
+    /// Check that a witnessed bitstring corresponds to a range of endoscalars
+    /// provided as public inputs.
+    fn recover_bitstring<
+        L: Layouter<C::Base>,
+        const BITSTRING_NUM_BITS: usize,
+        const WINDOW_NUM_BITS: usize,
+        const NUM_WINDOWS: usize,
+    >(
+        &self,
+        layouter: L,
+        bitstring: &be::RunningSum<C::Base, WINDOW_NUM_BITS, NUM_WINDOWS>,
+        pub_input_rows: [usize; NUM_WINDOWS],
+    ) -> Result<(), Error>;
 }

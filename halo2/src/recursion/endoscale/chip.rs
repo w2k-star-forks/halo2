@@ -423,11 +423,70 @@ where
             },
         )
     }
+
+    fn recover_bitstring<
+        L: Layouter<C::Base>,
+        const BITSTRING_NUM_BITS: usize,
+        const WINDOW_NUM_BITS: usize,
+        const NUM_WINDOWS: usize,
+    >(
+        &self,
+        mut layouter: L,
+        bitstring: &be::RunningSum<C::Base, WINDOW_NUM_BITS, NUM_WINDOWS>,
+        pub_input_rows: [usize; NUM_WINDOWS],
+    ) -> Result<(), Error> {
+        layouter.assign_region(
+            || "Recover bitstring from endoscalars",
+            |mut region| {
+                let mut offset = 0;
+
+                // Copy the running sum into the correct offset.
+                for (idx, z) in bitstring.zs().enumerate() {
+                    z.copy_advice(
+                        || format!("Copy running sum {}", NUM_WINDOWS - idx),
+                        &mut region,
+                        self.running_sum_chunks.z(),
+                        offset + idx,
+                    )?;
+                }
+
+                // For each chunk, lookup the (chunk, endoscalar) pair.
+                for (chunk, pub_input_row) in bitstring.windows().iter().zip(pub_input_rows.iter())
+                {
+                    self.q_lookup.enable(&mut region, offset)?;
+
+                    let _computed_endoscalar =
+                        chunk.map(|c| endoscale_scalar(C::Base::zero(), &c.bits()));
+                    // Copy endoscalar from given row on instance column
+                    let _copied_endoscalar = region.assign_advice_from_instance(
+                        || format!("Endoscalar at row {:?}", pub_input_row),
+                        self.endoscalars,
+                        *pub_input_row,
+                        self.endoscalars_copy,
+                        offset,
+                    )?;
+
+                    #[cfg(test)]
+                    {
+                        if let Some(&copied) = _copied_endoscalar.value() {
+                            if let Some(computed) = _computed_endoscalar {
+                                assert_eq!(copied, computed);
+                            }
+                        }
+                    }
+
+                    offset += 1;
+                }
+
+                Ok(())
+            },
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{EndoscaleConfig, EndoscaleInstructions, TableConfig};
+    use super::{endoscale_scalar, EndoscaleConfig, EndoscaleInstructions, TableConfig};
     use ff::PrimeFieldBits;
     use halo2_gadgets::utilities::lebs2ip;
     use halo2_proofs::{
@@ -438,7 +497,7 @@ mod tests {
     };
     use pasta_curves::{pallas, vesta};
 
-    use std::{convert::TryInto, marker::PhantomData};
+    use std::{convert::TryInto, marker::PhantomData, vec};
 
     #[derive(Default)]
     struct BaseCircuit<
@@ -551,6 +610,7 @@ mod tests {
         C::Base: PrimeFieldBits,
     {
         bitstring: Option<[bool; NUM_BITS]>,
+        pub_input_rows: Option<[usize; NUM_BITS_DIV10]>,
         _marker: PhantomData<C>,
     }
 
@@ -635,6 +695,13 @@ mod tests {
                 &bitstring_chunks,
             )?;
 
+            // Recover bitstring from public input endoscalars.
+            config.recover_bitstring::<_, NUM_BITS, 10, NUM_BITS_DIV10>(
+                layouter.namespace(|| "recover bitstring with lookup"),
+                &bitstring_chunks,
+                self.pub_input_rows.unwrap(),
+            )?;
+
             Ok(())
         }
     }
@@ -644,10 +711,19 @@ mod tests {
         BaseCurve::Base: PrimeFieldBits,
         ScalarCurve::Base: PrimeFieldBits,
     {
+        use ff::Field;
         use halo2_proofs::dev::MockProver;
 
         // Random 60-bit challenge.
         let bitstring: Vec<_> = (0..60).map(|_| rand::random::<bool>()).collect();
+        let endos = (0..6)
+            .rev()
+            .map(|i| {
+                let start_idx = i * 10;
+                let chunk = &bitstring[start_idx..(start_idx + 10)];
+                endoscale_scalar(ScalarCurve::Base::zero(), chunk.try_into().unwrap())
+            })
+            .collect();
 
         let base_circuit = BaseCircuit::<BaseCurve, 60, 30, 6> {
             bitstring: Some(bitstring.clone().try_into().unwrap()),
@@ -655,6 +731,7 @@ mod tests {
         };
         let scalar_circuit = ScalarCircuit::<ScalarCurve, 60, 30, 6> {
             bitstring: Some(bitstring.try_into().unwrap()),
+            pub_input_rows: Some((0..6).collect::<Vec<_>>().try_into().unwrap()),
             _marker: PhantomData,
         };
 
@@ -663,7 +740,7 @@ mod tests {
         assert_eq!(base_prover.verify(), Ok(()));
 
         // Calls endoscale_scalar
-        let scalar_prover = MockProver::run(11, &scalar_circuit, vec![vec![]]).unwrap();
+        let scalar_prover = MockProver::run(11, &scalar_circuit, vec![endos]).unwrap();
         assert_eq!(scalar_prover.verify(), Ok(()));
 
         // TODO: Check consistency of resulting commitment / endoscalar
